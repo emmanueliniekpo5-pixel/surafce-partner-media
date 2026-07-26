@@ -2,6 +2,7 @@
 /**
  * Plugin Name: Surface Partner Media
  * Description: Image stamp and media tools.
+ * Version: 1.0.1
  */
 
 if(!defined('ABSPATH')) exit;
@@ -34,6 +35,25 @@ $products = get_posts([
 ]);
 
 ob_start();
+
+$surface_dashboard_url = home_url('/surface-internet-registry/');
+
+echo '<div style="width:100%;max-width:900px;margin:0 auto 18px;box-sizing:border-box;">';
+echo '<a href="' . esc_url($surface_dashboard_url) . '" style="
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:9px 13px;
+    background:#f3f4f6;
+    color:#111827;
+    border:1px solid #d1d5db;
+    border-radius:8px;
+    text-decoration:none;
+    font-size:14px;
+    font-weight:700;
+    box-sizing:border-box;
+">← Dashboard</a>';
+echo '</div>';
 
 if (isset($_GET['surface_audio_stamp']) && isset($_GET['node'])) {
     $node_id = intval($_GET['node']);
