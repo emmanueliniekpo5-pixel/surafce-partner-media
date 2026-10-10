@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SurfaceMark
  * Description: Applies the Surface Internet mark to images and videos before download.
- * Version: 1.0.11
+ * Version: 1.0.30
  */
 
 if(!defined('ABSPATH')) exit;
@@ -13,7 +13,102 @@ static function init(){
 
 add_shortcode('surface_media',[__CLASS__,'media']);
 add_action('admin_post_surface_download_video',[__CLASS__,'download_video']);
+add_action('wp_ajax_surface_start_video_stamp',[__CLASS__,'ajax_start_video_stamp']);
+add_action('wp_ajax_surface_video_stamp_status',[__CLASS__,'ajax_video_stamp_status']);
+add_action('init',[__CLASS__,'cleanup_stale_video_exports']);
 
+}
+
+private static function service_types(){
+    return [
+        'artisans','professional_services','home_services','health_wellness',
+        'beauty_grooming','education_training','technology_digital','automotive',
+        'hospitality_events','logistics_delivery','creative_services','properties',
+        'other_services'
+    ];
+}
+
+private static function is_service_surface($post_id){
+    $mode = sanitize_key((string) get_post_meta($post_id, '_surface_signal_mode', true));
+    if ($mode === 'service') return true;
+    $type = sanitize_key((string) get_post_meta($post_id, '_surface_signal_type', true));
+    return in_array($type, self::service_types(), true);
+}
+
+private static function is_ride_surface($post_id){
+    $mode = sanitize_key((string)get_post_meta($post_id, '_surface_signal_mode', true));
+    $type = sanitize_key((string)get_post_meta($post_id, '_surface_signal_type', true));
+    return $mode === 'ride' || $type === 'ride';
+}
+
+/*
+ * Shelf Pins are intentionally separate from Surface PIN.
+ * They are partner-owned display preferences for the Shelf/SurfaceCase only.
+ */
+private static function shelf_pin_meta_key(){
+    return '_surface_shelf_pinned_surfaceteeth';
+}
+
+private static function get_shelf_pins($user_id){
+    $saved = get_user_meta((int)$user_id, self::shelf_pin_meta_key(), true);
+
+    if (!is_array($saved)) {
+        $saved = [];
+    }
+
+    $pins = [];
+    foreach ($saved as $post_id) {
+        $post_id = (int)$post_id;
+        if ($post_id > 0 && !in_array($post_id, $pins, true)) {
+            $pins[] = $post_id;
+        }
+        if (count($pins) >= 3) break;
+    }
+
+    return $pins;
+}
+
+private static function shelf_pin_user_owns_surface($post_id, $user_id){
+    $post_id = (int)$post_id;
+    $user_id = (int)$user_id;
+    if ($post_id <= 0 || $user_id <= 0) return false;
+
+    return (int)get_post_meta($post_id, '_surface_partner_user_id', true) === $user_id;
+}
+
+private static function save_shelf_pins($user_id, $available_ids){
+    if (!isset($_POST['surface_save_shelf_pins'])) return '';
+
+    $nonce = isset($_POST['surface_shelf_pins_nonce'])
+        ? sanitize_text_field(wp_unslash($_POST['surface_shelf_pins_nonce']))
+        : '';
+
+    if (!wp_verify_nonce($nonce, 'surface_save_shelf_pins')) {
+        return 'Shelf pins could not be verified.';
+    }
+
+    $available_ids = array_values(array_unique(array_map('intval', (array)$available_ids)));
+    $pins = [];
+
+    for ($slot = 1; $slot <= 3; $slot++) {
+        $field = 'surface_shelf_pin_' . $slot;
+        $post_id = isset($_POST[$field]) ? (int)$_POST[$field] : 0;
+
+        if ($post_id <= 0) continue;
+        if (!in_array($post_id, $available_ids, true)) continue;
+        if (!self::shelf_pin_user_owns_surface($post_id, $user_id)) continue;
+        if (in_array($post_id, $pins, true)) continue;
+
+        $pins[] = $post_id;
+    }
+
+    update_user_meta(
+        (int)$user_id,
+        self::shelf_pin_meta_key(),
+        array_slice($pins, 0, 3)
+    );
+
+    return 'Pinned SurfaceTeeth updated.';
 }
 
 static function media(){
@@ -28,17 +123,39 @@ $products = get_posts([
 'post_status'    => 'any',
 'posts_per_page' => 100,
 'meta_query'     => [
+        'relation' => 'AND',
         [
                 'key'   => '_surface_partner_user_id',
                 'value' => $user
+        ],
+        [
+                'relation' => 'OR',
+                [
+                        'key'     => '_surface_operations_surfacetooth_status',
+                        'compare' => 'NOT EXISTS'
+                ],
+                [
+                        'key'     => '_surface_operations_surfacetooth_status',
+                        'value'   => 'suspended',
+                        'compare' => '!='
+                ]
         ]
 ]
 ]);
+
+$surface_shelf_pin_notice = self::save_shelf_pins(
+    $user,
+    wp_list_pluck($products, 'ID')
+);
+$surface_shelf_pins = self::get_shelf_pins($user);
 
 ob_start();
 
 $surface_video_notice = '';
 $surface_video_error  = '';
+$surface_ffmpeg_diagnostics = [];
+$surface_video_auto_download_url = '';
+$surface_video_diagnostic = self::get_video_diagnostic(get_current_user_id());
 
 if (isset($_POST['surface_stamp_video'], $_POST['surface_video_product'])) {
     $video_product_id = (int) $_POST['surface_video_product'];
@@ -53,8 +170,20 @@ if (isset($_POST['surface_stamp_video'], $_POST['surface_video_product'])) {
 
         if (is_wp_error($video_result)) {
             $surface_video_error = $video_result->get_error_message();
+            if ($video_result->get_error_code() === 'surface_ffmpeg_missing') {
+                $surface_ffmpeg_diagnostics = self::ffmpeg_diagnostics();
+            }
         } else {
-            $surface_video_notice = 'Surfaced Video Ready';
+            $surface_video_notice = 'Surfaced Video Ready. Your download will begin automatically.';
+            if (is_array($video_result) && !empty($video_result['download_url'])) {
+                $surface_video_auto_download_url = esc_url_raw(
+                    html_entity_decode(
+                        (string) $video_result['download_url'],
+                        ENT_QUOTES,
+                        'UTF-8'
+                    )
+                );
+            }
         }
     }
 }
@@ -83,6 +212,20 @@ if ($surface_video_notice !== '') {
 }
 if ($surface_video_error !== '') {
     echo '<div style="max-width:900px;margin:0 auto 14px;background:#fee2e2;color:#991b1b;padding:10px 12px;border-radius:8px;font-weight:700;box-sizing:border-box;">' . esc_html($surface_video_error) . '</div>';
+}
+if (!empty($surface_video_diagnostic)) {
+    echo self::render_video_diagnostic($surface_video_diagnostic);
+}
+
+if ($surface_shelf_pin_notice !== '') {
+    echo '<div style="max-width:900px;margin:0 auto 14px;background:#eef6ff;color:#174a7c;padding:10px 12px;border-radius:8px;font-weight:700;box-sizing:border-box;">' . esc_html($surface_shelf_pin_notice) . '</div>';
+}
+
+if (!empty($surface_ffmpeg_diagnostics)) {
+    echo self::render_ffmpeg_diagnostics($surface_ffmpeg_diagnostics);
+}
+if ($surface_video_auto_download_url !== '') {
+    echo '<script>(function(){var u=' . wp_json_encode($surface_video_auto_download_url) . ';window.setTimeout(function(){window.location.href=u;},350);})();</script>';
 }
 
 if (isset($_GET['surface_audio_stamp']) && isset($_GET['node'])) {
@@ -142,6 +285,9 @@ $image_id = 0;
 $image_url = '';
 if ($post_type === 'surface_signal') {
     $image_url = (string) get_post_meta($product_id, '_surface_signal_image_url', true);
+    if ($image_url === '' && self::is_ride_surface($product_id)) {
+        $image_url = (string)get_post_meta($product_id, '_surface_ride_vehicle_photo_url', true);
+    }
     $video_url = (string) get_post_meta($product_id, '_surface_signal_video_url', true);
     $audio_url = (string) get_post_meta($product_id, '_surface_signal_audio_url', true);
 } else {
@@ -153,9 +299,9 @@ if ($post_type === 'surface_signal') {
     $audio_url = (string) get_post_meta($product_id, '_surface_market_audio_url', true);
     
 }
-if($image_url){
+if($image_url || $video_url || $audio_url){
 
-// SHOW VIDEO IF EXISTS
+// SHOW VIDEO/AUDIO PREVIEW IF EXISTS
 if ($audio_url) {
 
    $ready_url = ($post_type === 'surface_signal')
@@ -180,56 +326,29 @@ if ($ready_url) {
 }
 
 if ($video_url) {
-    $ready_video_url = ($post_type === 'surface_signal')
-    ? get_post_meta($product_id, '_surface_signal_video_ready_url', true)
-    : get_post_meta($product_id, '_surface_market_video_ready_url', true);
+// Use the same existing identity lookup as the video export, not the workspace's unrelated $sku variable.
+$video_mark_sku = self::surface_video_sku($product_id);
 echo '<div class="surface-mark-media-label surface-mark-video-label">Surface Video</div>';
-
 echo '<div class="surface-mark-media-block surface-mark-video-block">';
 
-echo '<video controls class="surface-mark-video-player">
-        <source src="' . esc_url($video_url) . '" type="video/mp4">
-      </video>';
-
-if ($ready_video_url) {
-
-$video_download_url = wp_nonce_url(
-    admin_url('admin-post.php?action=surface_download_video&product_id=' . (int) $product_id),
-    'surface_download_video_' . (int) $product_id
-);
-
-echo '<a href="' . esc_url($video_download_url) . '"
-        style="position:absolute;top:12px;right:12px;background:rgba(0,0,0,0.6);
-        color:#fff;width:38px;height:38px;display:flex;align-items:center;
-        justify-content:center;border-radius:999px;text-decoration:none;font-size:18px;z-index:20;"
-        aria-label="Download surfaced video" title="Download surfaced video">
-        ⬇
-      </a>';
-
-echo '<form method="post" style="position:absolute;top:12px;right:58px;margin:0;z-index:20;">';
+// The preview always uses the permanent original video from Backblaze.
+// The overlays are a layout preview only; FFmpeg creates the actual downloadable export.
+echo '<div class="surface-video-editor" data-surface-video-editor>';
+echo '<div class="surface-video-preview" data-surface-video-preview>';
+echo '<video controls class="surface-mark-video-player"><source src="' . esc_url($video_url) . '" type="video/mp4"></video>';
+echo '<div class="surface-video-overlay" data-overlay="mark" style="left:4%;top:78%">@' . esc_html($video_mark_sku) . '</div>';
+echo '</div>';
+echo '<p class="surface-video-help">Drag the SurfaceMark directly on the video to position it.</p>';
+echo '<form method="post" class="surface-mark-video-form">';
 echo '<input type="hidden" name="surface_video_product" value="' . (int) $product_id . '">';
 echo '<input type="hidden" name="surface_video_nonce" value="' . esc_attr(wp_create_nonce('surface_stamp_video_' . $product_id)) . '">';
-echo '<button type="submit" name="surface_stamp_video" value="1"
-        style="border:0;padding:0;background:rgba(0,0,0,0.6);color:#fff;width:38px;height:38px;display:flex;align-items:center;justify-content:center;border-radius:999px;cursor:pointer;font-size:18px;"
-        aria-label="Recreate surfaced video" title="Recreate surfaced video">↻</button>';
-echo '</form>';
-
-echo '<div style="background:#ecfdf5;color:#065f46;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:600;display:inline-block;margin-top:8px;">Surfaced Video Ready</div>';
-
-} else {
-    echo '<form method="post" style="position:absolute;top:12px;right:12px;margin:0;z-index:3;">';
-    echo '<input type="hidden" name="surface_video_product" value="' . (int) $product_id . '">';
-    echo '<input type="hidden" name="surface_video_nonce" value="' . esc_attr(wp_create_nonce('surface_stamp_video_' . $product_id)) . '">';
-    echo '<button type="submit" name="surface_stamp_video" value="1"
-        style="border:0;padding:0;background:rgba(0,0,0,0.6);color:#fff;width:38px;height:38px;display:flex;align-items:center;justify-content:center;border-radius:999px;cursor:pointer;font-size:18px;"
-        aria-label="Surface and download video" title="Surface and download video">⬇</button>';
-    echo '</form>';
-}
+echo '<input type="hidden" name="surface_mark_x" value="4"><input type="hidden" name="surface_mark_y" value="78">';
+echo '<button type="button" class="surface-video-export" name="surface_stamp_video" value="1">Surface and download video</button>';
+echo '<div id="surfaceVideoDebug" role="status" aria-live="polite" style="display:block;margin-top:10px;padding:10px;background:#fff7ed;color:#7c2d12;border:1px solid #fdba74;border-radius:8px;font:12px/1.5 monospace;white-space:pre-wrap;overflow-wrap:anywhere;">SurfaceMark diagnostics ready. Click the button to capture the exact server response here.</div>';
+echo '<script>(function(){var box=document.getElementById("surfaceVideoDebug");if(!box)return;window.addEventListener("error",function(e){box.textContent="JAVASCRIPT ERROR: "+(e.message||"unknown")+" at "+(e.filename||"unknown file")+":"+(e.lineno||"?");});window.addEventListener("unhandledrejection",function(e){box.textContent="JAVASCRIPT PROMISE ERROR: "+String(e.reason&&e.reason.message||e.reason||"unknown");});})();</script>';
+echo '</form></div>';
 
 echo '</div>'; // video wrapper
-
-
-
 }
 $post_type = get_post_type($product_id);
 
@@ -255,13 +374,13 @@ echo "<div id='surfaceCaptionData' data-surface='" . esc_attr($surface_name) . "
 
 
 echo '<div id="surfaceStampPreview" style="position:relative;display:inline-block;max-width:420px;">';
-echo "<img src='" . esc_url($image_url) . "' style='max-width:100%;height:auto;display:block;object-fit:contain;background:#000;border-radius:10px;'>";
-echo '<a href="#" id="downloadStampedImage" data-filename="' . esc_attr($download_name) . '" onclick="event.preventDefault();var btn=this;var target=document.getElementById(\'surfaceStampPreview\');if(!target){alert(\'Preview not found\');return false;}var oldDisplay=btn.style.display;btn.style.display=\'none\';html2canvas(target,{scale:2,useCORS:true,allowTaint:true,backgroundColor:null}).then(function(canvas){btn.style.display=oldDisplay;var link=document.createElement(\'a\');link.download=\'' . esc_attr($download_name) . '\';link.href=canvas.toDataURL(\'image/png\');document.body.appendChild(link);link.click();document.body.removeChild(link);}).catch(function(){btn.style.display=oldDisplay;alert(\'Download failed\');});return false;" style="position:absolute;top:12px;right:12px;background:rgba(0,0,0,0.45);color:#fff;width:38px;height:38px;display:flex;align-items:center;justify-content:center;border-radius:999px;text-decoration:none;font-size:18px;">⬇</a>';
-echo '<div style="position:absolute;bottom:0;left:0;display:flex;flex-direction:column;gap:2px;align-items:flex-start;max-width:78%;">
-  
-  <span style="margin:0 0 0 0;background:rgba(0,0,0,0.55);color:#fff;padding:6px 10px;border-radius:6px;font-weight:700;font-size:13px;line-height:1.05;letter-spacing:0.2px;display:inline-block;">@' . esc_html($sku) . '</span>
-</div>';
-
+if ($image_url !== '') {
+    echo "<img src='" . esc_url($image_url) . "' style='max-width:100%;height:auto;display:block;object-fit:contain;background:#000;border-radius:10px;'>";
+    echo '<a href="#" id="downloadStampedImage" data-filename="' . esc_attr($download_name) . '" onclick="event.preventDefault();var btn=this;var target=document.getElementById(\'surfaceStampPreview\');if(!target){alert(\'Preview not found\');return false;}var oldDisplay=btn.style.display;btn.style.display=\'none\';html2canvas(target,{scale:2,useCORS:true,allowTaint:true,backgroundColor:null}).then(function(canvas){btn.style.display=oldDisplay;var dataUrl=canvas.toDataURL(\'image/png\');var fileName=\'' . esc_attr($download_name) . '\';if(window.SurfaceAndroidDownloads&&typeof window.SurfaceAndroidDownloads.saveDataUrl===\'function\'){window.SurfaceAndroidDownloads.saveDataUrl(fileName,dataUrl);return;}var link=document.createElement(\'a\');link.download=fileName;link.href=dataUrl;document.body.appendChild(link);link.click();document.body.removeChild(link);}).catch(function(){btn.style.display=oldDisplay;alert(\'Download failed\');});return false;" style="position:absolute;top:12px;right:12px;background:rgba(0,0,0,0.45);color:#fff;width:38px;height:38px;display:flex;align-items:center;justify-content:center;border-radius:999px;text-decoration:none;font-size:18px;">⬇</a>';
+    echo '<div style="position:absolute;bottom:0;left:0;display:flex;flex-direction:column;gap:2px;align-items:flex-start;max-width:78%;">
+      <span style="margin:0 0 0 0;background:rgba(0,0,0,0.55);color:#fff;padding:6px 10px;border-radius:6px;font-weight:700;font-size:13px;line-height:1.05;letter-spacing:0.2px;display:inline-block;">@' . esc_html($sku) . '</span>
+    </div>';
+}
 echo "</div>";
 
 echo "<div style='margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:420px;'>
@@ -328,7 +447,7 @@ if(isset($_GET['audio_preview']) && isset($_GET['node'])){
 
     if($post_type === 'surface_signal'){
         $kxcode = get_post_meta($node_id, '_surface_kxcode', true);
-        $node_type = 'SIGNAL NODE';
+        $node_type = self::is_ride_surface($node_id) ? 'RIDE SURFACETOOTH' : (self::is_service_surface($node_id) ? 'SERVICE SURFACETOOTH' : 'BROADCAST SURFACETOOTH');
     }else{
         $product = function_exists('wc_get_product') ? wc_get_product($node_id) : null;
         $kxcode = $product ? $product->get_sku() : '';
@@ -491,6 +610,15 @@ echo '<style>
     background:#000;
     object-fit:contain;
 }
+.surface-video-editor{max-width:560px;margin:12px auto 22px;padding:14px;border:1px solid #dbe2ea;border-radius:14px;background:#f8fafc;box-sizing:border-box}
+.surface-video-preview{position:relative;width:100%;line-height:0;overflow:hidden;border-radius:10px;background:#000;touch-action:pan-y}
+.surface-video-preview video{display:block;width:100%;height:auto;max-height:620px;object-fit:contain}
+.surface-video-overlay{position:absolute;left:10%;top:70%;z-index:4;max-width:80%;padding:6px 9px;background:rgba(0,0,0,.72);color:#fff;border:1px dashed rgba(255,255,255,.85);border-radius:5px;font:700 12px/1.25 sans-serif;line-height:1.25;cursor:move;pointer-events:auto;touch-action:none;user-select:none;-webkit-user-select:none;white-space:pre-wrap;overflow-wrap:anywhere}
+.surface-video-overlay.is-dragging{outline:2px solid #22c55e}
+.surface-video-editor label{display:block;margin:10px 0 5px;font-size:13px;font-weight:700;color:#0f172a}
+.surface-video-editor input[type=text]{width:100%;min-height:40px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;box-sizing:border-box}
+.surface-video-editor .surface-video-help{font-size:12px;color:#475569;line-height:1.45;margin:8px 0}
+.surface-video-editor .surface-video-export{display:inline-flex;align-items:center;justify-content:center;margin-top:12px;padding:11px 16px;border:0;border-radius:9px;background:#111827;color:#fff;font-weight:800;cursor:pointer}
 .surface-mark-audio-player{
     display:block;
     width:100%!important;
@@ -563,6 +691,54 @@ echo '<style>
 }
 </style>';
 
+echo '<section class="surface-shelf-pin-panel" style="max-width:900px;margin:0 auto 22px;padding:16px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-sizing:border-box;">';
+echo '<div style="font-size:16px;font-weight:800;color:#111827;margin-bottom:5px;">Pinned SurfaceTeeth</div>';
+echo '<div style="font-size:13px;color:#6b7280;line-height:1.5;margin-bottom:14px;">Choose up to 3 SurfaceTeeth to stay fixed at the top of your Shelf. Pin 1 appears first, then Pin 2 and Pin 3. This is separate from Surface PIN.</div>';
+echo '<form method="post" action="#surfaceNodeThumbs">';
+echo wp_nonce_field('surface_save_shelf_pins', 'surface_shelf_pins_nonce', true, false);
+echo '<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;">';
+
+for ($slot = 1; $slot <= 3; $slot++) {
+    $selected_pin = isset($surface_shelf_pins[$slot - 1]) ? (int)$surface_shelf_pins[$slot - 1] : 0;
+
+    echo '<label style="display:block;font-size:12px;font-weight:800;color:#374151;">Pin ' . (int)$slot;
+    echo '<select name="surface_shelf_pin_' . (int)$slot . '" style="display:block;width:100%;margin-top:6px;padding:10px;border:1px solid #d1d5db;border-radius:9px;background:#fff;color:#111827;">';
+    echo '<option value="0">Not pinned</option>';
+
+    foreach ($products as $pin_product) {
+        $pin_id = (int)$pin_product->ID;
+        $pin_type = get_post_type($pin_id);
+        $pin_token = '';
+
+        if ($pin_type === 'surface_signal') {
+            $pin_token = (string)get_post_meta($pin_id, '_surface_kxcode', true);
+            if ($pin_token === '') {
+                $pin_token =
+                    (string)get_post_meta($pin_id, '_surface_signal_target', true)
+                    . (string)get_post_meta($pin_id, '_surface_signal_suffix', true);
+            }
+        } else {
+            $pin_token = (string)get_post_meta($pin_id, '_sku', true);
+        }
+
+        $pin_label = get_the_title($pin_id);
+        if ($pin_token !== '') {
+            $pin_label .= ' /' . ltrim($pin_token, '/#@');
+        }
+
+        echo '<option value="' . $pin_id . '"' . selected($selected_pin, $pin_id, false) . '>' . esc_html($pin_label) . '</option>';
+    }
+
+    echo '</select>';
+    echo '</label>';
+}
+
+echo '</div>';
+echo '<button type="submit" name="surface_save_shelf_pins" value="1" style="margin-top:12px;border:0;border-radius:10px;background:#111827;color:#fff;padding:11px 15px;font-weight:800;cursor:pointer;">Save Shelf Pins</button>';
+echo '</form>';
+echo '</section>';
+echo '<style>@media(max-width:700px){.surface-shelf-pin-panel form>div{grid-template-columns:1fr!important;}}</style>';
+
 echo '<div id="surfaceNodeThumbs" class="surface-mark-library">';
 
 foreach($products as $p){
@@ -570,6 +746,9 @@ foreach($products as $p){
 
     if ($post_type === 'surface_signal') {
         $thumb = (string) get_post_meta($p->ID, '_surface_signal_image_url', true);
+        if ($thumb === '' && self::is_ride_surface($p->ID)) {
+            $thumb = (string)get_post_meta($p->ID, '_surface_ride_vehicle_photo_url', true);
+        }
         $signal_target = (string) get_post_meta($p->ID, '_surface_signal_target', true);
         $signal_suffix = (string) get_post_meta($p->ID, '_surface_signal_suffix', true);
 
@@ -581,7 +760,13 @@ foreach($products as $p){
         $suffix_clean = preg_replace('/[^a-z0-9]/', '', $suffix_clean);
 
         $sku = $target_clean . $suffix_clean;
-        $surface_type = 'Broadcast SurfaceTooth';
+        if (self::is_ride_surface($p->ID)) {
+            $surface_type = 'Ride SurfaceTooth';
+        } elseif (self::is_service_surface($p->ID)) {
+            $surface_type = 'Service SurfaceTooth';
+        } else {
+            $surface_type = 'Broadcast SurfaceTooth';
+        }
     } else {
         $thumb = (string) get_post_meta($p->ID, '_surface_market_image_url', true);
         $sku = get_post_meta($p->ID, '_sku', true);
@@ -593,6 +778,8 @@ foreach($products as $p){
         $thumb_src .= (strpos($thumb_src, '?') === false ? '?' : '&') . 'v=' . (int) $p->ID;
     }
 
+    // SurfaceMark It only selects the SurfaceTooth and opens its preview.
+    // Video stamping is deliberately started only from the video preview controls.
     echo '<form method="post" action="#surfaceMarkWorkspace" class="surface-mark-card-form">';
     echo '<input type="hidden" name="surface_media_product" value="'.(int)$p->ID.'">';
     echo '<input type="hidden" name="surface_stamp_product" value="1">';
@@ -636,6 +823,115 @@ echo "<script>
 
 document.addEventListener('DOMContentLoaded', function(){
 
+  document.querySelectorAll('.surface-mark-video-form').forEach(function(form){
+    var button = form.querySelector('button[name=surface_stamp_video]');
+    if(!button) return;
+    button.addEventListener('click', function(event){
+      var product = form.querySelector('input[name=surface_video_product]');
+      var nonce = form.querySelector('input[name=surface_video_nonce]');
+      var debugBox = document.getElementById('surfaceVideoDebug');
+      if(!product || !nonce) { if(debugBox)debugBox.textContent='SETUP ERROR: product ID or security nonce field is missing.'; return; }
+
+      event.preventDefault();
+      if(debugBox)debugBox.textContent='1. Button click captured by JavaScript. Sending request to WordPress AJAX…';
+      if(button.dataset.surfaceBusy === '1') return false;
+      button.dataset.surfaceBusy = '1';
+      button.disabled = true;
+      button.style.opacity = '0.7';
+      button.style.cursor = 'wait';
+      button.textContent = '…';
+      button.setAttribute('title','Creating Video SurfaceMark');
+
+      var status = document.getElementById('surfaceVideoStampStatus');
+      if(!status){
+        status=document.createElement('div');
+        status.id='surfaceVideoStampStatus';
+        status.style.cssText='position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:99999;background:#111827;color:#fff;padding:12px 16px;border-radius:10px;font:600 13px/1.4 sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.25);max-width:90vw;';
+        document.body.appendChild(status);
+      }
+      status.textContent='Starting video SurfaceMark…';
+
+      var data=new URLSearchParams();
+      data.append('action','surface_start_video_stamp');
+      data.append('product_id',product.value);
+      data.append('nonce',nonce.value);
+      ['mark_x','mark_y'].forEach(function(key){var field=form.querySelector('[name=surface_'+key+']');if(field)data.append(key,field.value);});
+      fetch('" . esc_js(admin_url('admin-ajax.php')) . "',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:data.toString()})
+      .then(function(r){return r.text().then(function(t){if(debugBox)debugBox.textContent='2. Start request HTTP '+r.status+' '+r.statusText+'\\nResponse body:\\n'+t;var parsed;try{parsed=JSON.parse(t);}catch(e){throw new Error('Start request returned non-JSON (HTTP '+r.status+'). Response is shown above.');}if(!r.ok)throw new Error('Start request failed with HTTP '+r.status+'. See response above.');return parsed;});})
+      .then(function(json){
+        if(!json || !json.success || !json.data || !json.data.job_id) throw new Error((json&&json.data&&json.data.message)||'Video stamping could not be started.');
+        var jobId=json.data.job_id;
+        var poll=setInterval(function(){
+          var p=new URLSearchParams(); p.append('action','surface_video_stamp_status'); p.append('job_id',jobId);
+          fetch('" . esc_js(admin_url('admin-ajax.php')) . "',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:p.toString()})
+          .then(function(r){return r.text().then(function(t){if(debugBox)debugBox.textContent='Status request HTTP '+r.status+' '+r.statusText+'\\nResponse body:\\n'+t;var parsed;try{parsed=JSON.parse(t);}catch(e){throw new Error('Status request returned non-JSON (HTTP '+r.status+'). Response is shown above.');}if(!r.ok)throw new Error('Status request failed with HTTP '+r.status+'. See response above.');return parsed;});})
+          .then(function(j){
+            if(!j||!j.success) throw new Error((j&&j.data&&j.data.message)||'Video status could not be read.');
+            var d=j.data||{};
+            status.textContent=(d.stage||'Processing')+(d.elapsed?' — '+d.elapsed+' elapsed':'')+(d.detail?' — '+d.detail:'');
+            if(d.status==='complete' && d.download_url){
+              clearInterval(poll); status.textContent='SurfaceMark ready — starting download…';
+              var downloadLink=document.createElement('a');
+              downloadLink.href=d.download_url;
+              downloadLink.textContent='Download surfaced video';
+              downloadLink.style.cssText='display:inline-block;margin-left:10px;color:#fff;text-decoration:underline;font-weight:700';
+              status.appendChild(downloadLink);
+              // Use the fresh, tokenized URL returned by this completed job, not any legacy saved-video URL.
+              window.location.assign(d.download_url);
+              setTimeout(function(){if(status&&status.parentNode)status.parentNode.removeChild(status);},10000);
+            } else if(d.status==='failed'){
+              clearInterval(poll); status.textContent='SurfaceMark failed: '+(d.error||d.detail||'Unknown error.');
+              button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';
+            }
+          })
+          .catch(function(err){clearInterval(poll); status.textContent=err.message||'Video status failed.'; if(debugBox)debugBox.textContent='REQUEST ERROR: '+(err.message||String(err)); button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';});
+        },1500);
+      })
+      .catch(function(err){
+        status.textContent=err.message||'Video stamping could not be started.'; if(debugBox)debugBox.textContent='START ERROR: '+(err.message||String(err));
+        button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';
+      });
+      return false;
+    });
+  });
+
+  document.querySelectorAll('[data-surface-video-editor]').forEach(function(editor){
+    var preview=editor.querySelector('[data-surface-video-preview]');
+    var form=editor.querySelector('.surface-mark-video-form');
+    var mark=editor.querySelector('[data-overlay=mark]');
+    if(!preview||!form||!mark) return;
+    var xField=form.querySelector('[name=surface_mark_x]');
+    var yField=form.querySelector('[name=surface_mark_y]');
+    if(!xField||!yField) return;
+    var dragging=false,offsetX=0,offsetY=0;
+    function updatePosition(e){
+      if(!dragging)return;
+      var r=preview.getBoundingClientRect();
+      var maxLeft=Math.max(0,r.width-mark.offsetWidth);
+      var maxTop=Math.max(0,r.height-mark.offsetHeight);
+      var left=Math.max(0,Math.min(maxLeft,e.clientX-r.left-offsetX));
+      var top=Math.max(0,Math.min(maxTop,e.clientY-r.top-offsetY));
+      var x=(left/r.width)*100;
+      var y=(top/r.height)*100;
+      mark.style.left=x+'%';mark.style.top=y+'%';
+      xField.value=x.toFixed(2);yField.value=y.toFixed(2);
+      e.preventDefault();
+    }
+    mark.addEventListener('pointerdown',function(e){
+      if(e.button!==undefined && e.button!==0)return;
+      e.stopPropagation();
+      var mr=mark.getBoundingClientRect();
+      dragging=true;mark.classList.add('is-dragging');mark.style.touchAction='none';
+      offsetX=e.clientX-mr.left;offsetY=e.clientY-mr.top;
+      try{mark.setPointerCapture(e.pointerId);}catch(err){}
+      e.preventDefault();
+    });
+    document.addEventListener('pointermove',updatePosition,{passive:false});
+    function stop(){dragging=false;mark.classList.remove('is-dragging');}
+    mark.addEventListener('pointerup',stop);mark.addEventListener('pointercancel',stop);
+    document.addEventListener('pointerup',stop);document.addEventListener('pointercancel',stop);
+  });
+
   var surfaceWorkspace = document.getElementById('surfaceMarkWorkspace');
   if(surfaceWorkspace){
     setTimeout(function(){ surfaceWorkspace.scrollIntoView({behavior:'smooth',block:'start'}); }, 120);
@@ -675,9 +971,19 @@ const socialBtn = document.getElementById('downloadSocial');
 
       ctx.drawImage(canvas, 0, 0, width, height);
 
+      var dataUrl = resizedCanvas.toDataURL('image/png');
+
+      if (
+        window.SurfaceAndroidDownloads &&
+        typeof window.SurfaceAndroidDownloads.saveDataUrl === 'function'
+      ) {
+        window.SurfaceAndroidDownloads.saveDataUrl(filename, dataUrl);
+        return;
+      }
+
       var link = document.createElement('a');
       link.download = filename;
-      link.href = resizedCanvas.toDataURL('image/png');
+      link.href = dataUrl;
 
       document.body.appendChild(link);
       link.click();
@@ -690,7 +996,6 @@ const socialBtn = document.getElementById('downloadSocial');
   }
 
   document.addEventListener('click', function(e) {
-  alert('Surface Media JS loaded');
   var stampedImageBtn = e.target.closest('#downloadStampedImage');
   if (!stampedImageBtn) return;
 
@@ -712,8 +1017,8 @@ var surface = capNode.getAttribute('data-surface');
 var sku = capNode.getAttribute('data-sku');
 
 var caption =
-'#' + surface + '\n' +
-'#' + sku + '\n\n' +
+'#' + surface + '\\n' +
+'#' + sku + '\\n\\n' +
 'KXCODE: ' + sku;
 
 navigator.clipboard.writeText(caption);
@@ -748,8 +1053,8 @@ var surface = document.querySelector('#surfaceCaptionData').dataset.surface;
 var sku = document.querySelector('#surfaceCaptionData').dataset.sku;
 
 var caption =
-'#' + surface + '\n' +
-'#' + sku + '\n\n' +
+'#' + surface + '\\n' +
+'#' + sku + '\\n\\n' +
 'KXCODE: ' + sku;
 
 navigator.clipboard.writeText(caption);
@@ -821,6 +1126,104 @@ public static function surface_debug_panel($title,$data){
     echo '<div style="background:#111;color:#0f0;padding:12px;margin:12px 0;border-radius:8px;font:12px monospace;"><strong>'.esc_html($title).'</strong><pre style="white-space:pre-wrap;">'.esc_html(print_r($data,true)).'</pre></div>';
 }
 
+private static function video_position($value){
+    if (!is_numeric($value)) return 0.0;
+    return max(0.0, min(100.0, (float)$value));
+}
+
+public static function ajax_start_video_stamp(){
+    if (!is_user_logged_in()) wp_send_json_error(['message'=>'Please sign in again.'],401);
+    $product_id = isset($_POST['product_id']) ? (int)$_POST['product_id'] : 0;
+    $nonce = isset($_POST['nonce']) ? sanitize_text_field(wp_unslash($_POST['nonce'])) : '';
+    $user_id = get_current_user_id();
+    if (!$product_id || !wp_verify_nonce($nonce,'surface_stamp_video_'.$product_id)) {
+        wp_send_json_error(['message'=>'Video request could not be verified.'],403);
+    }
+    if (!self::user_owns_surface($product_id,$user_id)) {
+        wp_send_json_error(['message'=>'You cannot process this Surface video.'],403);
+    }
+    $post_type=get_post_type($product_id);
+    $video_url=(string)get_post_meta($product_id,$post_type==='surface_signal'?'_surface_signal_video_url':'_surface_market_video_url',true);
+    if ($video_url==='') wp_send_json_error(['message'=>'This SurfaceTooth has no video to stamp.'],400);
+    if (self::ffmpeg_path()==='') wp_send_json_error(['message'=>'FFmpeg is not available to the website PHP process.'],500);
+    $settings = [
+        'mark_x' => self::video_position($_POST['mark_x'] ?? 4),
+        'mark_y' => self::video_position($_POST['mark_y'] ?? 78),
+    ];
+    $job=self::start_video_stamp_job($product_id,SurfacePartnerCore::current_surface_identity(),$user_id,$settings);
+    if (is_wp_error($job)) wp_send_json_error(['message'=>$job->get_error_message()],500);
+    wp_send_json_success($job);
+}
+
+public static function ajax_video_stamp_status(){
+    if (!is_user_logged_in()) wp_send_json_error(['message'=>'Please sign in again.'],401);
+    $job_id=isset($_POST['job_id'])?sanitize_key(wp_unslash($_POST['job_id'])):'';
+    if ($job_id==='') wp_send_json_error(['message'=>'Missing video job.'],400);
+    $job=get_transient('surface_video_job_'.$job_id);
+    if (!is_array($job) || (int)($job['user_id']??0)!==get_current_user_id()) {
+        wp_send_json_error(['message'=>'Video job is unavailable.'],404);
+    }
+    $started=(float)($job['started_at']??0); $updated=(float)($job['updated_at']??0);
+    $download_url = (string)($job['download_url'] ?? '');
+    // The background CLI worker cannot mint a nonce tied to the visitor's browser session.
+    // Mint/attach the download nonce here, inside the authenticated AJAX request instead.
+    if (($job['status'] ?? '') === 'complete' && $download_url !== '') {
+        $download_url = remove_query_arg('_wpnonce', $download_url);
+        $download_url = add_query_arg(
+            '_wpnonce',
+            wp_create_nonce('surface_download_video_' . (int)($job['product_id'] ?? 0)),
+            $download_url
+        );
+    }
+    wp_send_json_success([
+        'status'=>(string)($job['status']??'queued'),
+        'stage'=>(string)($job['stage']??'Queued'),
+        'detail'=>(string)($job['detail']??''),
+        'elapsed'=>$started>0?number_format(max(0,($updated>0?$updated:microtime(true))-$started),1):'',
+        'download_url'=>$download_url,
+        'error'=>(string)($job['error']??''),
+    ]);
+}
+
+public static function video_job_update($job_id,$status,$stage,$detail='',$extra=[]){
+    $job_id=sanitize_key((string)$job_id); if($job_id==='') return;
+    $key='surface_video_job_'.$job_id; $job=get_transient($key); if(!is_array($job)) return;
+    $now=microtime(true); if(empty($job['started_at'])) $job['started_at']=$now;
+    $job['status']=sanitize_key($status); $job['stage']=sanitize_text_field($stage); $job['detail']=sanitize_text_field($detail); $job['updated_at']=$now;
+    foreach((array)$extra as $k=>$v) $job[$k]=$v;
+    set_transient($key,$job,2*HOUR_IN_SECONDS);
+}
+
+private static function php_cli_path(){
+    $candidates=[];
+    if(defined('PHP_BINDIR')) $candidates[]=trailingslashit(PHP_BINDIR).'php';
+    $candidates[]='/usr/bin/php'; $candidates[]='/usr/local/bin/php';
+    foreach(array_unique($candidates) as $candidate) if(is_executable($candidate)) return $candidate;
+    if(function_exists('exec')){ $out=[];$code=1; @exec('command -v php 2>/dev/null',$out,$code); if($code===0&&!empty($out[0])&&is_executable(trim($out[0]))) return trim($out[0]); }
+    return '';
+}
+
+private static function start_video_stamp_job($product_id,$surface_name,$user_id,$settings=[]){
+    $php=self::php_cli_path();
+    if($php==='') return new WP_Error('surface_php_cli_missing','The VPS PHP command-line worker is not available.');
+    $job_id=strtolower(wp_generate_password(32,false,false));
+    $key='surface_video_job_'.$job_id; $now=microtime(true);
+    set_transient($key,['job_id'=>$job_id,'product_id'=>(int)$product_id,'user_id'=>(int)$user_id,'status'=>'queued','stage'=>'Queued','detail'=>'Video stamping worker is being started.','started_at'=>$now,'updated_at'=>$now,'settings'=>(array)$settings],2*HOUR_IN_SECONDS);
+    $worker_path=trailingslashit(get_temp_dir()).'surface-video-worker-'.$job_id.'.php';
+    $wp_load=ABSPATH.'wp-load.php';
+    $worker="<?php\n";
+    $worker.="require_once ".var_export($wp_load,true).";\n";
+    $worker.="register_shutdown_function(function(){ \$e=error_get_last(); if(\$e && in_array(\$e['type'],[E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR],true) && class_exists('SurfacePartnerMedia')) SurfacePartnerMedia::video_job_update(".var_export($job_id,true).",'failed','PHP worker stopped',(string)\$e['message'],['error'=>(string)\$e['message']]); });\n";
+    $worker.="\$user_id=(int)(\$argv[1]??0); \$product_id=(int)(\$argv[2]??0); \$surface_name=(string)(\$argv[3]??'surface'); \$job_id=(string)(\$argv[4]??''); wp_set_current_user(\$user_id);\n";
+    $worker.="if(!class_exists('SurfacePartnerMedia')){exit(1);} SurfacePartnerMedia::video_job_update(\$job_id,'running','Starting','Background video stamping worker is running.'); \$result=SurfacePartnerMedia::stamp_video(\$product_id,\$surface_name,\$job_id); if(is_wp_error(\$result)) SurfacePartnerMedia::video_job_update(\$job_id,'failed','Video stamping failed',\$result->get_error_message(),['error'=>\$result->get_error_message()]); @unlink(__FILE__);\n";
+    if(@file_put_contents($worker_path,$worker,LOCK_EX)===false){delete_transient($key);return new WP_Error('surface_worker_create_failed','The VPS could not create the video stamping worker.');}
+    $command='nohup '.escapeshellarg($php).' '.escapeshellarg($worker_path).' '.escapeshellarg((string)$user_id).' '.escapeshellarg((string)$product_id).' '.escapeshellarg((string)$surface_name).' '.escapeshellarg($job_id).' >/dev/null 2>&1 & echo $!';
+    $out=[];$code=1; @exec($command,$out,$code);
+    if($code!==0){@unlink($worker_path);delete_transient($key);return new WP_Error('surface_worker_start_failed','The VPS could not start the background video worker.');}
+    self::video_job_update($job_id,'running','Started','Video stamping is running in the background.');
+    return ['job_id'=>$job_id,'status'=>'running'];
+}
+
 public static function download_video(){
     if (!is_user_logged_in()) {
         auth_redirect();
@@ -838,36 +1241,47 @@ public static function download_video(){
         wp_die('You cannot download this Surface video.', 403);
     }
 
-    $post_type = get_post_type($product_id);
-    $ready_url = ($post_type === 'surface_signal')
-        ? (string) get_post_meta($product_id, '_surface_signal_video_ready_url', true)
-        : (string) get_post_meta($product_id, '_surface_market_video_ready_url', true);
+    $token = isset($_GET['surface_video_token'])
+        ? sanitize_text_field(wp_unslash($_GET['surface_video_token']))
+        : '';
 
-    if ($ready_url === '') {
-        wp_die('The surfaced video is not ready yet.');
+    if ($token !== '') {
+        $transient_key = 'surface_video_export_' . hash('sha256', $token);
+        $export = get_transient($transient_key);
+
+        if (!is_array($export)
+            || (int) ($export['user_id'] ?? 0) !== $user_id
+            || (int) ($export['product_id'] ?? 0) !== $product_id
+            || empty($export['path'])
+            || !is_file($export['path'])) {
+            delete_transient($transient_key);
+            wp_die('This surfaced video download has expired. Please stamp the video again.');
+        }
+
+        $temp_file = (string) $export['path'];
+        $filename = sanitize_file_name((string) ($export['filename'] ?? 'surfaced-video.mp4'));
+
+        // Keep the export token alive until the file has actually streamed.
+        // Longer downloads can be retried by the browser/proxy; deleting the
+        // transient before streaming turns a retry into a false "expired" page.
+        self::stream_video_download($temp_file, $filename, true, $transient_key);
     }
 
-    if (!function_exists('download_url')) {
-        require_once ABSPATH . 'wp-admin/includes/file.php';
+    wp_die('The surfaced video download is unavailable. Please stamp the video again.');
+}
+
+public static function stream_video_download($temp_file, $filename, $delete_after = true, $transient_key = ''){
+    if (!is_file($temp_file) || !is_readable($temp_file)) {
+        wp_die('The surfaced video file is unavailable.');
     }
 
     @set_time_limit(0);
-    $temp_file = download_url($ready_url, 300);
-    if (is_wp_error($temp_file) || !is_file($temp_file)) {
-        $message = is_wp_error($temp_file) ? $temp_file->get_error_message() : 'Download failed.';
-        wp_die(esc_html($message));
-    }
+    @ignore_user_abort(true);
 
-    $surface_name = class_exists('SurfacePartnerCore')
-        ? SurfacePartnerCore::current_surface_identity()
-        : 'surface';
-    $sku = self::surface_video_sku($product_id);
-    $filename = sanitize_file_name(($surface_name ?: 'surface') . '-' . ($sku ?: 'video') . '.mp4');
     $filesize = filesize($temp_file);
-
     nocache_headers();
     header('Content-Type: video/mp4');
-    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Content-Disposition: attachment; filename="' . sanitize_file_name($filename) . '"');
     header('Content-Transfer-Encoding: binary');
     header('X-Content-Type-Options: nosniff');
     if ($filesize !== false) {
@@ -879,17 +1293,39 @@ public static function download_video(){
     }
 
     $handle = fopen($temp_file, 'rb');
-    if ($handle) {
-        while (!feof($handle)) {
-            echo fread($handle, 1024 * 1024);
-            flush();
-        }
-        fclose($handle);
+    if (!$handle) {
+        if ($delete_after) @unlink($temp_file);
+        wp_die('The surfaced video could not be opened.');
     }
 
-    @unlink($temp_file);
+    $stream_complete = true;
+    while (!feof($handle)) {
+        $chunk = fread($handle, 1024 * 1024);
+        if ($chunk === false) {
+            $stream_complete = false;
+            break;
+        }
+        echo $chunk;
+        flush();
+        if (function_exists('connection_aborted') && connection_aborted()) {
+            $stream_complete = false;
+            break;
+        }
+    }
+    fclose($handle);
+
+    // Only consume the one-time download token after the entire temporary
+    // file has been streamed successfully. If the connection is interrupted,
+    // leave the token/file available so the browser can retry within its TTL.
+    if ($stream_complete) {
+        if ($transient_key !== '') {
+            delete_transient($transient_key);
+        }
+        if ($delete_after) @unlink($temp_file);
+    }
     exit;
 }
+
 
 public static function user_owns_surface($product_id, $user_id){
     if (!$product_id || !$user_id) return false;
@@ -897,28 +1333,130 @@ public static function user_owns_surface($product_id, $user_id){
     return (int) get_post_meta($product_id, '_surface_partner_user_id', true) === (int) $user_id;
 }
 
+public static function php_function_available($function_name){
+    if (!function_exists($function_name)) return false;
+
+    $disabled = array_filter(array_map('trim', explode(',', (string) ini_get('disable_functions'))));
+    return !in_array($function_name, $disabled, true);
+}
+
+public static function ffmpeg_diagnostics(){
+    $ffmpeg = '/usr/bin/ffmpeg';
+    $ffprobe = '/usr/bin/ffprobe';
+    $exec_available = self::php_function_available('exec');
+    $shell_exec_available = self::php_function_available('shell_exec');
+    $proc_open_available = self::php_function_available('proc_open');
+    $open_basedir = trim((string) ini_get('open_basedir'));
+    $exec_output = [];
+    $exec_code = null;
+    $exec_message = '';
+
+    if ($exec_available) {
+        @exec(escapeshellarg($ffmpeg) . ' -version 2>&1', $exec_output, $exec_code);
+        $exec_message = !empty($exec_output) ? trim((string) $exec_output[0]) : '';
+    }
+
+    $temp_dir = get_temp_dir();
+
+    return [
+        'php_sapi' => PHP_SAPI,
+        'php_version' => PHP_VERSION,
+        'exec_available' => $exec_available,
+        'shell_exec_available' => $shell_exec_available,
+        'proc_open_available' => $proc_open_available,
+        'ffmpeg_exists' => file_exists($ffmpeg),
+        'ffmpeg_executable' => is_executable($ffmpeg),
+        'ffprobe_exists' => file_exists($ffprobe),
+        'ffprobe_executable' => is_executable($ffprobe),
+        'open_basedir' => $open_basedir !== '' ? $open_basedir : 'Not configured',
+        'temp_directory' => $temp_dir,
+        'temp_writable' => is_dir($temp_dir) && is_writable($temp_dir),
+        'exec_exit_code' => $exec_code,
+        'exec_first_line' => $exec_message,
+    ];
+}
+
+public static function render_ffmpeg_diagnostics($diagnostics){
+    $yes = '<span style="color:#047857;font-weight:800;">Available</span>';
+    $no = '<span style="color:#b91c1c;font-weight:800;">Unavailable</span>';
+    $rows = [
+        'Website PHP mode' => (string) ($diagnostics['php_sapi'] ?? 'Unknown'),
+        'PHP version' => (string) ($diagnostics['php_version'] ?? 'Unknown'),
+        'exec()' => !empty($diagnostics['exec_available']) ? $yes : $no,
+        'shell_exec()' => !empty($diagnostics['shell_exec_available']) ? $yes : $no,
+        'proc_open()' => !empty($diagnostics['proc_open_available']) ? $yes : $no,
+        '/usr/bin/ffmpeg exists' => !empty($diagnostics['ffmpeg_exists']) ? $yes : $no,
+        '/usr/bin/ffmpeg executable' => !empty($diagnostics['ffmpeg_executable']) ? $yes : $no,
+        '/usr/bin/ffprobe exists' => !empty($diagnostics['ffprobe_exists']) ? $yes : $no,
+        '/usr/bin/ffprobe executable' => !empty($diagnostics['ffprobe_executable']) ? $yes : $no,
+        'Temporary directory writable' => !empty($diagnostics['temp_writable']) ? $yes : $no,
+        'open_basedir' => esc_html((string) ($diagnostics['open_basedir'] ?? 'Unknown')),
+        'Temporary directory' => esc_html((string) ($diagnostics['temp_directory'] ?? 'Unknown')),
+    ];
+
+    if ($diagnostics['exec_exit_code'] !== null) {
+        $rows['FFmpeg PHP test exit code'] = esc_html((string) $diagnostics['exec_exit_code']);
+        $rows['FFmpeg PHP test response'] = esc_html((string) ($diagnostics['exec_first_line'] ?: 'No output returned'));
+    }
+
+    $html = '<details open style="max-width:900px;margin:0 auto 18px;background:#fff;border:1px solid #fecaca;border-radius:14px;padding:16px 18px;box-sizing:border-box;">';
+    $html .= '<summary style="cursor:pointer;font-weight:800;color:#111827;font-size:16px;">FFmpeg Diagnostics</summary>';
+    $html .= '<p style="margin:10px 0 14px;color:#6b7280;line-height:1.55;">Send this information to the VPS host. It checks the PHP process used by the website, not the root terminal.</p>';
+    $html .= '<div style="display:grid;grid-template-columns:minmax(180px,.8fr) minmax(0,1.2fr);gap:0;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">';
+    foreach ($rows as $label => $value) {
+        $html .= '<div style="padding:10px 12px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-weight:700;">' . esc_html($label) . '</div>';
+        $html .= '<div style="padding:10px 12px;border-bottom:1px solid #e5e7eb;overflow-wrap:anywhere;">' . $value . '</div>';
+    }
+    $html .= '</div>';
+    $html .= '<div style="margin-top:14px;padding:12px 14px;background:#fef2f2;border-radius:10px;color:#991b1b;line-height:1.55;"><strong>Host request:</strong> Enable <code>exec</code> for the website PHP process and ensure it can execute <code>/usr/bin/ffmpeg</code> and <code>/usr/bin/ffprobe</code>. If <code>open_basedir</code> is enabled, allow these binaries and the PHP temporary directory.</div>';
+    $html .= '</details>';
+    return $html;
+}
+
 public static function ffmpeg_path(){
+    if (!function_exists('exec')) return '';
+
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    if (in_array('exec', $disabled, true)) return '';
+
     $candidates = [
         '/usr/bin/ffmpeg',
         '/usr/local/bin/ffmpeg',
-        '/opt/homebrew/bin/ffmpeg',
         'ffmpeg',
     ];
 
     foreach ($candidates as $candidate) {
+        if ($candidate !== 'ffmpeg' && is_executable($candidate)) {
+            return $candidate;
+        }
+
         if ($candidate === 'ffmpeg') {
             $output = [];
             $code = 1;
             @exec('command -v ffmpeg 2>/dev/null', $output, $code);
             if ($code === 0 && !empty($output[0])) return trim($output[0]);
-            continue;
         }
-
-        if (is_executable($candidate)) return $candidate;
     }
 
     return '';
 }
+
+public static function cleanup_stale_video_exports(){
+    if (get_transient('surface_video_cleanup_lock')) return;
+    set_transient('surface_video_cleanup_lock', 1, HOUR_IN_SECONDS);
+
+    $pattern = trailingslashit(get_temp_dir()) . 'surface-video-*';
+    $files = glob($pattern);
+    if (!is_array($files)) return;
+
+    $cutoff = time() - (2 * HOUR_IN_SECONDS);
+    foreach ($files as $file) {
+        if (is_file($file) && @filemtime($file) < $cutoff) {
+            @unlink($file);
+        }
+    }
+}
+
 
 public static function surface_video_sku($product_id){
     $post_type = get_post_type($product_id);
@@ -943,6 +1481,7 @@ public static function create_video_mark_png($sku){
     }
 
     $text = '@' . trim((string) $sku);
+    if ($text === '') return new WP_Error('surface_mark_empty_text', 'The overlay text is empty.');
     $font_size = 24;
     $padding_x = 16;
     $padding_y = 10;
@@ -1013,16 +1552,50 @@ public static function create_video_mark_png($sku){
     return $path;
 }
 
-public static function stamp_video($product_id, $surface_name){
-    $surface_debug=[];
-    $surface_debug['ffmpeg_path']=self::ffmpeg_path();
-    if (!class_exists('Surface_Backblaze')) {
-        return new WP_Error('surface_b2_missing', 'Surface Backblaze is not available.');
+private static function video_diagnostic_update($product_id, $stage, $detail = ''){
+    $user_id = get_current_user_id();
+    if (!$user_id) return;
+    $started = microtime(true);
+    $existing = get_transient('surface_video_diag_' . (int) $user_id);
+    if ($stage !== 'Starting' && is_array($existing) && !empty($existing['started_at'])) {
+        $started = (float) $existing['started_at'];
     }
+    $data = [
+        'product_id' => (int) $product_id,
+        'stage'      => sanitize_text_field($stage),
+        'detail'     => sanitize_text_field($detail),
+        'started_at' => $started,
+        'updated_at' => microtime(true),
+    ];
+    set_transient('surface_video_diag_' . (int) $user_id, $data, 2 * HOUR_IN_SECONDS);
+}
 
+private static function get_video_diagnostic($user_id){
+    $user_id = (int) $user_id;
+    if (!$user_id) return [];
+    $data = get_transient('surface_video_diag_' . $user_id);
+    return is_array($data) ? $data : [];
+}
+
+private static function render_video_diagnostic($diag){
+    $elapsed = '';
+    if (!empty($diag['started_at']) && !empty($diag['updated_at'])) {
+        $elapsed = number_format(max(0, (float)$diag['updated_at'] - (float)$diag['started_at']), 1) . 's elapsed';
+    }
+    $stage = isset($diag['stage']) ? $diag['stage'] : 'Unknown';
+    $detail = isset($diag['detail']) ? $diag['detail'] : '';
+    return '<div style="max-width:900px;margin:0 auto 14px;background:#f3f4f6;color:#111827;padding:12px;border-radius:8px;border:1px solid #d1d5db;box-sizing:border-box;"><div style="font-weight:800;margin-bottom:4px;">SurfaceMark Video Diagnostic</div><div><strong>Last stage:</strong> ' . esc_html($stage) . '</div>' . ($detail !== '' ? '<div style="margin-top:3px;"><strong>Detail:</strong> ' . esc_html($detail) . '</div>' : '') . ($elapsed !== '' ? '<div style="margin-top:3px;color:#4b5563;">' . esc_html($elapsed) . '</div>' : '') . '<div style="margin-top:6px;font-size:12px;color:#6b7280;">Diagnostic checkpoint only. It does not change the temporary Backblaze → VPS → download workflow.</div></div>';
+}
+
+public static function stamp_video($product_id, $surface_name, $job_id = ''){
+    $job_data = $job_id !== '' ? get_transient('surface_video_job_' . sanitize_key($job_id)) : [];
+    $settings = is_array($job_data) && is_array($job_data['settings'] ?? null) ? $job_data['settings'] : [];
+    $mark_x = self::video_position($settings['mark_x'] ?? 4);
+    $mark_y = self::video_position($settings['mark_y'] ?? 78);
     $ffmpeg = self::ffmpeg_path();
+    self::video_diagnostic_update($product_id, 'Starting', 'Checking FFmpeg and video source.'); if ($job_id !== '') self::video_job_update($job_id, 'running', 'Starting', 'Checking FFmpeg and video source.');
     if ($ffmpeg === '') {
-        return new WP_Error('surface_ffmpeg_missing', 'FFmpeg is not available to SurfaceMark.');
+        return new WP_Error('surface_ffmpeg_missing', 'FFmpeg is not available to the website PHP process.');
     }
 
     $post_type = get_post_type($product_id);
@@ -1052,74 +1625,120 @@ public static function stamp_video($product_id, $surface_name){
     }
 
     @set_time_limit(0);
+    @ignore_user_abort(true);
 
-    $input_path = download_url($video_url, 300);
-    if (is_wp_error($input_path)) return $input_path;
+    // Backblaze remains the permanent source. WordPress only receives a temporary copy.
+    self::video_diagnostic_update($product_id, 'Backblaze download started', 'Waiting for the original video to reach the VPS.'); if ($job_id !== '') self::video_job_update($job_id, 'running', 'Backblaze download started', 'Waiting for the original video to reach the VPS.');
+    $download_started = microtime(true);
+    $input_path = download_url($video_url, 600);
+    $download_elapsed = number_format(max(0, microtime(true) - $download_started), 1);
+    if (!is_wp_error($input_path) && is_file($input_path)) {
+        self::video_diagnostic_update($product_id, 'Backblaze download complete', $download_elapsed . 's; ' . number_format(filesize($input_path) / 1048576, 1) . ' MB temporary source.'); if ($job_id !== '') self::video_job_update($job_id, 'running', 'Backblaze download complete', $download_elapsed . 's; ' . number_format(filesize($input_path) / 1048576, 1) . ' MB temporary source.');
+    }
+    if (is_wp_error($input_path) || !is_file($input_path)) {
+        return is_wp_error($input_path)
+            ? $input_path
+            : new WP_Error('surface_video_download_failed', 'The original Backblaze video could not be downloaded for stamping.');
+    }
 
+    self::video_diagnostic_update($product_id, 'Creating SurfaceMark', 'Generating the temporary mark image.'); if ($job_id !== '') self::video_job_update($job_id, 'running', 'Creating SurfaceMark', 'Generating the temporary mark image.');
     $mark_path = self::create_video_mark_png($sku);
     if (is_wp_error($mark_path)) {
         @unlink($input_path);
         return $mark_path;
     }
+    $output_path = trailingslashit(get_temp_dir()) . 'surface-video-' . (int)$product_id . '-' . wp_generate_password(12, false, false) . '.mp4';
 
-    $output_path = wp_tempnam('surface-video-' . $product_id . '.mp4');
-    if (!$output_path) {
-        @unlink($input_path);
-        @unlink($mark_path);
-        return new WP_Error('surface_temp_failed', 'Could not create the temporary surfaced video.');
-    }
-
-    @unlink($output_path);
-
-    $filter = '[1:v]format=rgba[mark];[0:v][mark]overlay=10:H-h-10:format=auto[v]';
+    // Only the selected SurfaceTooth's authorized SurfaceMark is overlaid; preserve the original video's audio.
+    $filter = '[1:v]format=rgba[mark];[0:v][mark]overlay=x=(W-w)*' . ($mark_x / 100) . ':y=(H-h)*' . ($mark_y / 100) . ':format=auto[v]';
     $command = escapeshellarg($ffmpeg)
-        . ' -y -i ' . escapeshellarg($input_path)
-        . ' -i ' . escapeshellarg($mark_path)
+        . ' -hide_banner -loglevel error -y'
+        . ' -i ' . escapeshellarg($input_path)
+        . ' -loop 1 -framerate 25 -i ' . escapeshellarg($mark_path)
         . ' -filter_complex ' . escapeshellarg($filter)
         . ' -map ' . escapeshellarg('[v]')
         . ' -map 0:a?'
         . ' -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p'
-        . ' -c:a aac -b:a 128k -movflags +faststart -shortest '
+        . ' -c:a aac -b:a 128k'
+        . ' -movflags +faststart -shortest -f mp4 '
         . escapeshellarg($output_path)
         . ' 2>&1';
 
     $output = [];
     $exit_code = 1;
+    self::video_diagnostic_update($product_id, 'FFmpeg started', 'Stamping video on the VPS.'); if ($job_id !== '') self::video_job_update($job_id, 'running', 'FFmpeg started', 'Stamping video on the VPS.');
+    $ffmpeg_started = microtime(true);
     @exec($command, $output, $exit_code);
-    $surface_debug['command']=$command;
-    $surface_debug['exit_code']=$exit_code;
-    $surface_debug['output']=$output;
-    self::surface_debug_panel('SurfaceMark Video Diagnostics',$surface_debug);
+    $ffmpeg_elapsed = number_format(max(0, microtime(true) - $ffmpeg_started), 1);
 
+    // Never retain the downloaded Backblaze source or temporary mark on the VPS.
     @unlink($input_path);
     @unlink($mark_path);
 
-    if ($exit_code !== 0 || !file_exists($output_path) || filesize($output_path) < 1) {
+    if ($exit_code !== 0 || !is_file($output_path) || filesize($output_path) < 1024) {
+        self::video_diagnostic_update($product_id, 'FFmpeg failed', $ffmpeg_elapsed . 's; exit code ' . (int)$exit_code . '.'); if ($job_id !== '') self::video_job_update($job_id, 'failed', 'FFmpeg failed', $ffmpeg_elapsed . 's; exit code ' . (int)$exit_code . '.', ['error' => $detail]);
         @unlink($output_path);
-        $detail = !empty($output) ? trim(implode(' | ', array_slice($output, -4))) : 'Unknown FFmpeg error.';
+        $detail = !empty($output) ? trim(implode(' | ', array_slice($output, -8))) : 'Unknown FFmpeg error.';
         return new WP_Error('surface_ffmpeg_failed', 'Video stamping failed: ' . $detail);
     }
 
     $safe_surface = sanitize_file_name($surface_name ?: 'surface');
-    $safe_sku = sanitize_file_name($sku);
-    $remote_name = 'surface/surfacemark/videos/' . (int) get_current_user_id() . '/' . $safe_surface . '-' . $safe_sku . '-' . time() . '.mp4';
+    $safe_sku = sanitize_file_name($sku ?: 'video');
+    $filename = sanitize_file_name($safe_surface . '-' . $safe_sku . '.mp4');
+    $token = wp_generate_password(48, false, false);
+    $transient_key = 'surface_video_export_' . hash('sha256', $token);
 
-    $upload = Surface_Backblaze::upload_file([
-        'file_path' => $output_path,
-        'file_name' => $remote_name,
-        'mime'      => 'video/mp4',
-    ]);
+    self::video_diagnostic_update($product_id, 'Stamped file ready', $ffmpeg_elapsed . 's FFmpeg time; ' . number_format(filesize($output_path) / 1048576, 1) . ' MB output.'); if ($job_id !== '') self::video_job_update($job_id, 'running', 'Stamped file ready', $ffmpeg_elapsed . 's FFmpeg time; ' . number_format(filesize($output_path) / 1048576, 1) . ' MB output.');
 
-    @unlink($output_path);
+    $export_data = [
+        'path'       => $output_path,
+        'filename'   => $filename,
+        'product_id' => (int) $product_id,
+        'user_id'    => (int) get_current_user_id(),
+        'created_at' => time(),
+    ];
 
-    if (is_wp_error($upload)) return $upload;
+    // Do not report a successful handoff unless WordPress can immediately
+    // retrieve the temporary export token it just stored.
+    $transient_saved = set_transient($transient_key, $export_data, 30 * MINUTE_IN_SECONDS);
+    $transient_verified = $transient_saved && is_array(get_transient($transient_key));
+    if (!$transient_verified) {
+        @unlink($output_path);
+        self::video_diagnostic_update($product_id, 'Download handoff failed', 'The temporary stamped file was created, but WordPress could not store its download token.'); if ($job_id !== '') self::video_job_update($job_id, 'failed', 'Download handoff failed', 'The temporary stamped file was created, but WordPress could not store its download token.', ['error'=>'Download handoff failed.']);
+        return new WP_Error('surface_video_export_store_failed', 'The surfaced video was created, but its download handoff could not be prepared. Please try again.');
+    }
 
-    update_post_meta($product_id, $ready_meta, esc_url_raw($upload['url']));
-    update_post_meta($product_id, $ready_key_meta, sanitize_text_field($upload['file_name']));
-    update_post_meta($product_id, $ready_id_meta, sanitize_text_field($upload['file_id']));
+    self::video_diagnostic_update($product_id, 'Download URL ready', 'Temporary stamped file is waiting for browser download.');
 
-    return $upload;
+    // Stamped exports are no longer permanent media records. The original Backblaze video is untouched.
+    delete_post_meta($product_id, $ready_meta);
+    delete_post_meta($product_id, $ready_key_meta);
+    delete_post_meta($product_id, $ready_id_meta);
+
+    /*
+     * This URL is consumed by JavaScript for automatic download.
+     * Do not use wp_nonce_url() here: it HTML-escapes query separators to
+     * &amp;, which is correct for HTML attributes but breaks the raw URL when
+     * assigned to window.location.href. Add the nonce as a normal query arg.
+     */
+    $download_url = add_query_arg([
+        'action'              => 'surface_download_video',
+        'product_id'          => (int) $product_id,
+        'surface_video_token' => $token,
+        '_wpnonce'            => wp_create_nonce(
+            'surface_download_video_' . (int) $product_id
+        ),
+    ], admin_url('admin-post.php'));
+
+    if ($job_id !== '') self::video_job_update($job_id, 'complete', 'Download URL ready', 'Temporary stamped SurfaceMark video is ready.', ['download_url'=>$download_url,'filename'=>$filename]);
+
+    return [
+        'download_url' => $download_url,
+        'filename'     => $filename,
+        'temporary'    => true,
+    ];
 }
+
 
 public static function bandwidth_limit_bytes($user_id = 0){
     $user_id = $user_id ?: get_current_user_id();
@@ -1171,3 +1790,11 @@ public static function consume_bandwidth($bytes, $user_id = 0){
 }
 
 SurfacePartnerMedia::init();
+
+
+
+
+
+
+
+
