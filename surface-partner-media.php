@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SurfaceMark
  * Description: Applies the Surface Internet mark to images and videos before download.
- * Version: 1.0.42
+ * Version: 1.0.44
  */
 
 if(!defined('ABSPATH')) exit;
@@ -329,7 +329,7 @@ echo '<div class="surface-mark-media-block surface-mark-video-block">';
 // The overlays are a layout preview only; FFmpeg creates the actual downloadable export.
 echo '<div class="surface-video-editor" data-surface-video-editor>';
 echo '<div class="surface-video-preview" data-surface-video-preview>';
-echo '<video controls class="surface-mark-video-player"><source src="' . esc_url($video_url) . '" type="video/mp4"></video>';
+echo '<video controls playsinline preload="auto" class="surface-mark-video-player"' . ($image_url !== '' ? ' poster="' . esc_url($image_url) . '"' : '') . '><source src="' . esc_url($video_url) . '" type="video/mp4"></video>';
 echo '<div class="surface-video-overlay" data-overlay="mark" style="left:4%;top:78%">@' . esc_html($video_mark_sku) . '</div>';
 echo '</div>';
 echo '<p class="surface-video-help">Drag the SurfaceMark directly on the video to position it.</p>';
@@ -1842,6 +1842,7 @@ public static function consume_bandwidth($bytes, $user_id = 0){
 }
 
 SurfacePartnerMedia::init();
+
 
 
 
