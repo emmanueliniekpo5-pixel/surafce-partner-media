@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SurfaceMark
  * Description: Applies the Surface Internet mark to images and videos before download.
- * Version: 1.0.33
+ * Version: 1.0.42
  */
 
 if(!defined('ABSPATH')) exit;
@@ -847,14 +847,14 @@ document.addEventListener('DOMContentLoaded', function(){
       data.append('nonce',nonce.value);
       ['mark_x','mark_y'].forEach(function(key){var field=form.querySelector('[name=surface_'+key+']');if(field)data.append(key,field.value);});
       fetch('" . esc_js(admin_url('admin-ajax.php')) . "',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:data.toString()})
-      .then(function(r){return r.text().then(function(t){var parsed;try{parsed=JSON.parse(t);}catch(e){throw new Error('The video service returned an unexpected response. Please try again.');}if(!r.ok)throw new Error('The video service could not start the export. Please try again.');return parsed;});})
+      .then(function(r){return r.text().then(function(t){var parsed;try{parsed=JSON.parse(t);}catch(e){throw new Error('The video service returned an unexpected response. Please try again.');}if(!r.ok)throw new Error((parsed&&parsed.data&&parsed.data.message)||('HTTP '+r.status+' while starting the video export.'));return parsed;});})
       .then(function(json){
         if(!json || !json.success || !json.data || !json.data.job_id) throw new Error((json&&json.data&&json.data.message)||'Video stamping could not be started.');
         var jobId=json.data.job_id;
         var poll=setInterval(function(){
           var p=new URLSearchParams(); p.append('action','surface_video_stamp_status'); p.append('job_id',jobId);
           fetch('" . esc_js(admin_url('admin-ajax.php')) . "',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:p.toString()})
-          .then(function(r){return r.text().then(function(t){var parsed;try{parsed=JSON.parse(t);}catch(e){throw new Error('The video service returned an unexpected status. Please try again.');}if(!r.ok)throw new Error('The video export status could not be checked. Please try again.');return parsed;});})
+          .then(function(r){return r.text().then(function(t){var parsed;try{parsed=JSON.parse(t);}catch(e){throw new Error('The video service returned an unexpected status. Please try again.');}if(!r.ok)throw new Error((parsed&&parsed.data&&parsed.data.message)||('HTTP '+r.status+' while checking video status.'));return parsed;});})
           .then(function(j){
             if(!j||!j.success) throw new Error((j&&j.data&&j.data.message)||'Video status could not be read.');
             var d=j.data||{};
@@ -867,7 +867,8 @@ document.addEventListener('DOMContentLoaded', function(){
               'Stamped file ready':'Finishing your video…',
               'Download URL ready':'Your video is ready. Starting download…'
             };
-            status.textContent=publicStage[d.stage]||'Preparing your video…';
+            var mainText=publicStage[d.stage]||'Preparing your video…';
+            if(status.firstChild && status.firstChild.nodeType===3){status.firstChild.textContent=mainText;}else{status.insertBefore(document.createTextNode(mainText),status.firstChild);}
             if(d.status==='complete' && d.download_url){
               clearInterval(poll); status.textContent='SurfaceMark ready — starting download…';
               var downloadLink=document.createElement('a');
@@ -879,15 +880,16 @@ document.addEventListener('DOMContentLoaded', function(){
               window.location.assign(d.download_url);
               setTimeout(function(){if(status&&status.parentNode)status.parentNode.removeChild(status);},10000);
             } else if(d.status==='failed'){
-              clearInterval(poll); status.textContent='SurfaceMark failed: '+(d.error||d.detail||'Unknown error.');
+              clearInterval(poll);
+              if(status.firstChild&&status.firstChild.nodeType===3){status.firstChild.textContent='SurfaceMark could not be completed. Please try again.';}
               button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';
             }
           })
-          .catch(function(){clearInterval(poll); status.textContent='Video export could not be completed. Please try again.'; button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';});
+          .catch(function(){clearInterval(poll); if(status.firstChild&&status.firstChild.nodeType===3){status.firstChild.textContent='Unable to check video progress. Please try again.';} button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';});
         },1500);
       })
-      .catch(function(err){
-        status.textContent=err.message||'Video stamping could not be started. Please try again.';
+      .catch(function(){
+        if(status.firstChild&&status.firstChild.nodeType===3){status.firstChild.textContent='Unable to start video stamping. Please try again.';}else{status.insertBefore(document.createTextNode('Unable to start video stamping. Please try again.'),status.firstChild);}
         button.disabled=false; button.dataset.surfaceBusy=''; button.style.opacity='1'; button.style.cursor='pointer'; button.textContent='⬇';
       });
       return false;
@@ -1177,10 +1179,8 @@ public static function ajax_video_stamp_status(){
     wp_send_json_success([
         'status'=>(string)($job['status']??'queued'),
         'stage'=>(string)($job['stage']??'Queued'),
-        'detail'=>(string)($job['detail']??''),
-        'elapsed'=>$started>0?number_format(max(0,($updated>0?$updated:microtime(true))-$started),1):'',
+        'elapsed'=>$started>0?number_format(max(0,microtime(true)-$started),1):'',
         'download_url'=>$download_url,
-        'error'=>(string)($job['error']??''),
     ]);
 }
 
@@ -1209,20 +1209,31 @@ private static function start_video_stamp_job($product_id,$surface_name,$user_id
     $key='surface_video_job_'.$job_id; $now=microtime(true);
     set_transient($key,['job_id'=>$job_id,'product_id'=>(int)$product_id,'user_id'=>(int)$user_id,'status'=>'queued','stage'=>'Queued','detail'=>'Video stamping worker is being started.','started_at'=>$now,'updated_at'=>$now,'settings'=>(array)$settings],2*HOUR_IN_SECONDS);
     $worker_path=trailingslashit(get_temp_dir()).'surface-video-worker-'.$job_id.'.php';
+    $worker_log_path=trailingslashit(get_temp_dir()).'surface-video-worker-'.$job_id.'.log';
     $wp_load=ABSPATH.'wp-load.php';
     $worker="<?php\n";
+    $worker.="\$surface_log_path=".var_export($worker_log_path,true).";\n";
+    $worker.="function surface_worker_log(\$message){ global \$surface_log_path; @file_put_contents(\$surface_log_path,'['.date('c').'] '.(string)\$message.PHP_EOL,FILE_APPEND|LOCK_EX); }\n";
+    $worker.="surface_worker_log('Worker process started; PHP '.PHP_VERSION.'.');\n";
+    $worker.="set_error_handler(function(\$severity,\$message,\$file,\$line){ surface_worker_log('PHP ERROR ['.\$severity.'] '.\$message.' in '.\$file.':'.\$line); return false; });\n";
+    $worker.="register_shutdown_function(function(){ \$e=error_get_last(); if(\$e && in_array(\$e['type'],[E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR],true)){ surface_worker_log('FATAL PHP ERROR: '.\$e['message'].' in '.\$e['file'].':'.\$e['line']); if(function_exists('get_transient') && class_exists('SurfacePartnerMedia')) SurfacePartnerMedia::video_job_update(".var_export($job_id,true).",'failed','PHP worker fatal error',(string)\$e['message'],['error'=>(string)\$e['message']]); } });\n";
+    $worker.="surface_worker_log('Loading WordPress bootstrap: '.".var_export($wp_load,true).");\n";
     $worker.="require_once ".var_export($wp_load,true).";\n";
-    $worker.="register_shutdown_function(function(){ \$e=error_get_last(); if(\$e && in_array(\$e['type'],[E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR],true) && class_exists('SurfacePartnerMedia')) SurfacePartnerMedia::video_job_update(".var_export($job_id,true).",'failed','PHP worker stopped',(string)\$e['message'],['error'=>(string)\$e['message']]); });\n";
+    $worker.="surface_worker_log('WordPress bootstrap loaded.');\n";
     $worker.="\$user_id=(int)(\$argv[1]??0); \$product_id=(int)(\$argv[2]??0); \$surface_name=(string)(\$argv[3]??'surface'); \$job_id=(string)(\$argv[4]??''); wp_set_current_user(\$user_id);\n";
     // All generated workers share one lock, so only one FFmpeg stamp can run at a time.
     $queue_lock_path = trailingslashit(get_temp_dir()) . 'surface-video-stamp.lock';
-    $worker .= "\$queue_lock=@fopen(" . var_export($queue_lock_path, true) . ",'c'); if(!\$queue_lock || !flock(\$queue_lock,LOCK_EX)){ if(class_exists('SurfacePartnerMedia')) SurfacePartnerMedia::video_job_update(\$job_id,'failed','Queue lock failed','Could not acquire the video-stamping queue lock.',['error'=>'Could not acquire the video-stamping queue lock.']); exit(1); }\n";
+    $worker .= "surface_worker_log('Queue lock investigation started. Lock path: ' ." . var_export($queue_lock_path, true) . "); \$queue_lock=@fopen(" . var_export($queue_lock_path, true) . ",'c'); if(!\$queue_lock){ surface_worker_log('FAILED: could not open/create queue lock file; check temp-directory permissions.'); if(class_exists('SurfacePartnerMedia')) SurfacePartnerMedia::video_job_update(\$job_id,'failed','Queue lock file error','Could not open/create queue lock file; check temp-directory permissions.',['error'=>'Could not open/create queue lock file.']); exit(1); } \$surface_lock_wait_started=microtime(true); \$surface_next_lock_report=0; while(!@flock(\$queue_lock,LOCK_EX|LOCK_NB)){ \$surface_waited=(int)(microtime(true)-\$surface_lock_wait_started); if(\$surface_waited>=\$surface_next_lock_report){ surface_worker_log('Queue lock is BUSY; this worker is waiting. Wait seconds: '.\$surface_waited.'; worker PID: '.getmypid().'.'); if(class_exists('SurfacePartnerMedia')) SurfacePartnerMedia::video_job_update(\$job_id,'queued','Waiting for queue lock','Queue lock is busy; worker PID '.getmypid().'; waited '.\$surface_waited.' seconds.'); \$surface_next_lock_report=\$surface_waited+5; } usleep(250000); } surface_worker_log('Queue lock acquired after '.number_format(microtime(true)-\$surface_lock_wait_started,2).' seconds; worker PID: '.getmypid().'.');\n";
     $worker .= "\$job_state=get_transient('surface_video_job_'.sanitize_key(\$job_id)); if(!is_array(\$job_state) || (\$job_state['status']??'')!=='queued'){ flock(\$queue_lock,LOCK_UN); fclose(\$queue_lock); @unlink(__FILE__); exit(0); }\n";
-    $worker .= "if(!class_exists('SurfacePartnerMedia')){ flock(\$queue_lock,LOCK_UN); fclose(\$queue_lock); exit(1); } SurfacePartnerMedia::video_job_update(\$job_id,'running','Starting','Video stamping worker acquired the queue lock.'); \$result=SurfacePartnerMedia::stamp_video(\$product_id,\$surface_name,\$job_id); if(is_wp_error(\$result)) SurfacePartnerMedia::video_job_update(\$job_id,'failed','Video stamping failed',\$result->get_error_message(),['error'=>\$result->get_error_message()]); flock(\$queue_lock,LOCK_UN); fclose(\$queue_lock); @unlink(__FILE__);\n";
+    $worker .= "if(!class_exists('SurfacePartnerMedia')){ surface_worker_log('FAILED: SurfacePartnerMedia class is unavailable after WordPress bootstrap.'); flock(\$queue_lock,LOCK_UN); fclose(\$queue_lock); exit(1); } surface_worker_log('SurfacePartnerMedia class found; entering stamp_video().'); SurfacePartnerMedia::video_job_update(\$job_id,'running','Starting','Video stamping worker acquired the queue lock.'); \$result=SurfacePartnerMedia::stamp_video(\$product_id,\$surface_name,\$job_id); if(is_wp_error(\$result)){ surface_worker_log('STAMP FAILED: '.\$result->get_error_message()); SurfacePartnerMedia::video_job_update(\$job_id,'failed','Video stamping failed',\$result->get_error_message(),['error'=>\$result->get_error_message()]); } else { surface_worker_log('stamp_video() returned without WP_Error.'); } flock(\$queue_lock,LOCK_UN); fclose(\$queue_lock); surface_worker_log('Worker finished and released queue lock.'); @unlink(__FILE__);\n";
     if(@file_put_contents($worker_path,$worker,LOCK_EX)===false){delete_transient($key);return new WP_Error('surface_worker_create_failed','The VPS could not create the video stamping worker.');}
     $command='nohup '.escapeshellarg($php).' '.escapeshellarg($worker_path).' '.escapeshellarg((string)$user_id).' '.escapeshellarg((string)$product_id).' '.escapeshellarg((string)$surface_name).' '.escapeshellarg($job_id).' >/dev/null 2>&1 & echo $!';
     $out=[];$code=1; @exec($command,$out,$code);
-    if($code!==0){@unlink($worker_path);delete_transient($key);return new WP_Error('surface_worker_start_failed','The VPS could not start the background video worker.');}
+    if($code!==0){@file_put_contents($worker_log_path,'['.date('c').'] FAILED: background launch command returned exit code '.(int)$code.'.'.PHP_EOL,FILE_APPEND|LOCK_EX);@unlink($worker_path);delete_transient($key);return new WP_Error('surface_worker_start_failed','The VPS could not start the background video worker (launch exit code '.(int)$code.').');}
+    $launch_pid=isset($out[0])?trim((string)$out[0]):'';
+    $job_state=get_transient($key);
+    if(is_array($job_state)){ $job_state['launch_pid']=$launch_pid; $job_state['updated_at']=microtime(true); set_transient($key,$job_state,2*HOUR_IN_SECONDS); }
+    @file_put_contents($worker_log_path,'['.date('c').'] Launch command returned exit code 0; reported PID: '.($launch_pid!==''?$launch_pid:'(none)').PHP_EOL,FILE_APPEND|LOCK_EX);
     // Keep the job queued until its worker acquires the shared lock.
     return ['job_id'=>$job_id,'status'=>'queued'];
 }
@@ -1831,6 +1842,7 @@ public static function consume_bandwidth($bytes, $user_id = 0){
 }
 
 SurfacePartnerMedia::init();
+
 
 
 
